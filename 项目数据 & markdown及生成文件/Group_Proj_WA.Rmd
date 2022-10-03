@@ -1,0 +1,325 @@
+---
+title: "Group_Proj_WA"
+author: "Group_1"
+date: "2022/6/26"
+output:
+  slidy_presentation: default
+  ioslides_presentation: default
+  beamer_presentation: default
+---
+
+```{r setup, echo = FALSE, message = FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(tidyverse)
+library(stringr)
+library(textcat)
+library(tm)
+library(wordcloud)
+library(wordcloud2)   # wordcloud
+library(quanteda)     # readability
+library(quanteda.textstats)
+library(quanteda.textplots)
+library(syuzhet)      # sentiment analysis
+library(quanteda.sentiment) # sentiment analysis for cluster test
+library(MASS)         # run regression
+library(stargazer)    # output form
+library(RColorBrewer)
+
+
+```
+
+### 导入数据与数据预处理
+
+```{r}
+review <- read.csv(".\\review.csv", stringsAsFactors = FALSE, header = TRUE)
+```
+
+
+首先我们筛选出UTF-8格式且为英文的评论，并根据slide5生成对应的变量：
+
+```{r}
+review <- review %>%
+  # 筛选需要的评论
+  mutate(
+    ReviewText = iconv(ReviewText,"UTF-8", "UTF-8",sub=""),
+    language = textcat(ReviewText)
+  ) %>%
+  filter(!is.na(ReviewText)) %>% 
+  filter(language == "english") %>%
+  filter(ReviewID!="272094473") %>%
+  # 对Age与Gender预处理
+  mutate(
+    Age = ifelse(Age=="|"|Age=="Another", NA, Age),
+    Gender = str_to_lower(Gender)
+  ) %>%
+  # 生成对应的变量
+  mutate(
+    Not_Disclosure = ifelse(is.na(Gender)|is.na(Age), T, F),
+    Gender = ifelse(is.na(Gender), "NA", Gender),
+    women = ifelse(Gender == "female" & Not_Disclosure==F, T, F),
+    Age = ifelse(is.na(Age),"NA", Age),
+    YoungAge = ifelse(Age %in% c("25-34", "18-24", "13-17") & Not_Disclosure==F, T, F),
+    MidAge = ifelse(Age == "35-49" & Not_Disclosure==F, T, F),
+    OldAge = ifelse(Age %in% c("50-64", "65+") & Not_Disclosure==F, T, F),
+    Rating_Deviation = abs(AvgRatingStarsThisUser - Obs_Avg_Rating),
+    WC = str_count(ReviewText,boundary("word")), # 思考数字是否需要保留
+    # WC = str_count(str_remove_all(ReviewText,"\\d{0,}"),boundary("word")),
+    HotelID = as.factor(HotelID),
+    year = as.factor(str_extract(year_month, "\\d{2}"))
+  )
+
+```
+
+### 对文本进行处理
+
+**1.文本预处理**
+
+首先得到基础的语料库，然后进行标准化操作，并生成DF：
+
+```{r}
+# 方法：参考quanteda资料，使用corpus的方法生成，更有利于处理（ref1:https://quanteda.io/articles/pkgdown/quickstart_cn.html；ref2:https://zhuanlan.zhihu.com/p/439456688）
+# 生成语料库
+review_corpus <- corpus(review$ReviewText)
+# 标准化语料库，此语料库课用于可视化展示，若不需要可以在下面生成DTM一起解决
+review_tokens <- review_corpus %>%
+  tokens(
+    remove_punct = T, 
+    remove_symbols = T, 
+    remove_numbers = T,
+    remove_separators = T
+  ) 
+# 生成DTM的dataframe
+review_DTM <- review_tokens %>%
+  dfm(
+    # set lowercasing
+    tolower = T,  
+    # stemming to TRUE
+    stem = T,
+    # provide the stopwords for deletion
+    remove = stopwords("english")
+  ) %>%
+  as.matrix() %>% 
+  as.data.frame()
+
+```
+
+
+```{r}
+doc_id <- rownames(review_DTM)
+
+WC_tokens <- summary(review_tokens) %>%
+  as.data.frame() %>% 
+  dplyr::select(Freq) %>% 
+  transmute(WC = Freq) %>% 
+  slice(1:10044) %>%   
+  mutate(doc = doc_id)
+
+```
+
+### 词性分析
+
+**1. 环境初始化**
+
+```{r}
+#词性标记-基于spacyr包
+#https://cran.r-project.org/web/packages/spacyr/vignettes/using_spacyr.html
+
+library(spacyr)
+library(reticulate)
+spacy_initialize(model = "en_core_web_sm")
+#spacyr is base on spaCy package of Python, it need to library the package of R-Python connection "reticulate", and initialize the python env as well. Meanwhile, the python interpreter of Rstudio should install spaCy and "en_core_web_*" model of language.
+
+#in anaconda prompt: conda install spaCy, spacy-model-en_core_web_sm
+#if the initialization is processed successfully, it will return the interpreter's directory and the information as followed:
+#successfully initialized (spaCy Version: 3.3.0, language model: en_core_web_sm)
+```
+
+**2. 词云的探索 - 形容词**
+
+```{r}
+#词性分析与形容词词云绘制
+review_pos <- review_corpus %>% 
+  spacy_parse(tag = TRUE, entity = FALSE, lemma = FALSE) %>% 
+  as_tibble()
+review_tokens_ADJ <- review_pos %>% 
+  filter(pos == "ADJ") %>% 
+  mutate(token = str_to_lower(token)) %>% 
+  group_by(token) %>% 
+  summarise(freq = n()) %>% 
+  filter(str_detect(token, pattern = "[:punct:]", negate = T)) %>% 
+  filter(str_detect(token, pattern = "[:digit:]", negate = T)) %>% 
+  filter(str_detect(token, pattern = "[:symbol:]", negate = T))
+wordcloud2::wordcloud2(review_tokens_ADJ)
+#Two fields are available for part-of-speech tags. The pos field returned is the Universal tagset for parts-of-speech, a general scheme that most users will find serves their needs, and also that provides equivalencies across languages.
+#"tag" is a more detailed tagset provided by spacy, defined in each spacy language model, for English, this is the OntoNote5 version of the Penn Treebank tag set.
+
+```
+
+### 基于特征的文本情感分析
+
+```{r}
+
+#feature based sentiment analysis
+#特征提取
+review_tokens_NOUN <- review_pos %>% 
+  filter(pos == "NOUN") %>% 
+  mutate(token = str_to_lower(token)) %>% 
+  group_by(token) %>% 
+  summarise(freq = n()) %>% 
+  filter(str_detect(token, pattern = "[:punct:]", negate = T)) %>% 
+  filter(str_detect(token, pattern = "[:digit:]", negate = T)) %>% 
+  filter(str_detect(token, pattern = "[:symbol:]", negate = T)) %>% 
+  arrange(desc(freq))
+wordcloud2::wordcloud2(review_tokens_NOUN)
+#room
+#service
+#parking
+#location
+#breakfast
+#staff
+#bed
+#price
+#基于依赖关系
+review_dependency <- review_corpus %>% 
+  spacy_parse(pos = T, 
+              tag = F, 
+              lemma = F,
+              entity = T,
+              dependency = T,
+              nounphrase = T)
+pattern_feature <- "room|service|parking|location|breakfast|staff|bed|price"
+feature_doc <- review_dependency %>% 
+  filter(str_detect(token, pattern = pattern_feature)) %>% 
+  distinct(doc_id)
+review_dependency_feature <- review_dependency %>% 
+  filter(doc_id %in% feature_doc$doc_id)
+prop_feature = nrow(review_dependency_feature)/nrow(review_dependency)
+#至少包含一个我们选择的特征的样本占全样本的96.39%
+#基于特征的情感分析函数
+feature_bases_sentiment <- function(feature){
+  review_dependency <- review_corpus %>% 
+    spacy_parse(pos = T, 
+                tag = F, 
+                lemma = F,
+                entity = T,
+                dependency = T,
+                nounphrase = T)
+  feature_doc <- review_dependency %>% 
+    filter(str_detect(token, pattern = feature)) %>% 
+    distinct(doc_id)
+  review_dependency_feature <- review_dependency %>% 
+    filter(doc_id %in% feature_doc$doc_id) %>%
+    group_by(doc_id) %>% 
+    mutate(token_lag = lead(token)) %>% 
+    filter(token_lag == feature)
+  feature_sentiment <- review_dependency_feature %>% 
+    filter(dep_rel == "amod") %>% 
+    group_by(doc_id) %>% 
+    mutate(sentiment = syuzhet::get_sentiment(token, method = "bing")) %>% 
+    summarise(feature_sentiment = mean(sentiment, na.rm = T))
+  colnames(feature_sentiment) = str_c(feature, "sentiment", sep = "_")
+  return(feature_sentiment)
+}
+
+room_sentiment <- feature_bases_sentiment(feature = "room")
+service_sentiment <- feature_bases_sentiment(feature = "service")
+parking_sentiment <- feature_bases_sentiment(feature = "parking")
+location_sentiment <- feature_bases_sentiment(feature = "location")
+breakfast_sentiment <- feature_bases_sentiment(feature = "breakfast")
+staff_sentiment <- feature_bases_sentiment(feature = "staff")
+bed_sentiment <- feature_bases_sentiment(feature = "bed")
+price_sentiment <- feature_bases_sentiment(feature = "price")
+
+```
+
+**回归分析**
+
+```{r}
+room_sentiment <- as.data.frame(room_sentiment) 
+names(room_sentiment) <- c("doc_id", "value_room")
+
+service_sentiment <- as.data.frame(service_sentiment) 
+names(service_sentiment) <- c("doc_id", "value_service")
+
+parking_sentiment <- as.data.frame(parking_sentiment) 
+names(parking_sentiment) <- c("doc_id", "value_parking")
+
+location_sentiment <- as.data.frame(location_sentiment) 
+names(location_sentiment) <- c("doc_id", "value_location")
+
+breakfast_sentiment <- as.data.frame(breakfast_sentiment) 
+names(breakfast_sentiment) <- c("doc_id", "value_breakfast")
+
+staff_sentiment <- as.data.frame(staff_sentiment) 
+names(staff_sentiment) <- c("doc_id", "value_staff")
+
+bed_sentiment <- as.data.frame(bed_sentiment) 
+names(bed_sentiment) <- c("doc_id", "value_bed")
+
+price_sentiment <- as.data.frame(price_sentiment) 
+names(price_sentiment) <- c("doc_id", "value_price")
+
+```
+
+
+```{r}
+#回归
+rating <- as_factor(review$AvgRatingStarsThisUser)
+review_featured <- review %>% 
+  mutate(doc_id = str_c("text", rownames(review))) %>% 
+  left_join(room_sentiment, by = "doc_id") %>% 
+  left_join(service_sentiment, by = "doc_id") %>% 
+  left_join(parking_sentiment, by = "doc_id") %>% 
+  left_join(location_sentiment, by = "doc_id") %>% 
+  left_join(breakfast_sentiment, by = "doc_id") %>% 
+  left_join(staff_sentiment, by = "doc_id") %>% 
+  left_join(bed_sentiment, by = "doc_id") %>% 
+  left_join(price_sentiment, by = "doc_id") %>% 
+  mutate(
+    room_sentiment = if_else(is.na(value_room), 0, value_room),
+    service_sentiment = if_else(is.na(value_service), 0, value_service),
+    parking_sentiment = if_else(is.na(value_parking), 0, value_parking),
+    location_sentiment = if_else(is.na(value_location), 0, value_location),
+    breakfast_sentiment = if_else(is.na(value_breakfast), 0, value_breakfast),
+    staff_sentiment = if_else(is.na(value_staff), 0, value_staff),
+    bed_sentiment = if_else(is.na(value_bed), 0, value_bed),
+    price_sentiment = if_else(is.na(value_price), 0, value_price),
+    readability = textstat_readability(review_corpus, measure = "Flesch.Kincaid")$Flesch.Kincaid
+    )
+```
+
+```{r}
+room <- review_featured$room_sentiment
+service <- review_featured$service_sentiment
+parking <- review_featured$parking_sentiment
+location <- review_featured$location_sentiment
+breakfast <- review_featured$breakfast_sentiment
+staff <- review_featured$staff_sentiment
+bed <- review_featured$bed_sentiment
+price <- review_featured$price_sentiment
+
+fit <- polr(rating ~ 
+              room + 
+              service +
+              parking + 
+              location + 
+              breakfast + 
+              staff + 
+              bed + 
+              price + 
+              women + 
+              MidAge + 
+              OldAge + 
+              readability + 
+              HotelID + 
+              year + 
+              log(WC) + 
+              Not_Disclosure, 
+            review_featured)
+summary(fit)
+stargazer(list(fit), type = "text", omit = c("year", "HotelID"))
+```

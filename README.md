@@ -1,4 +1,2 @@
 # Wuhan-University-2022-EM-summer-school
-武汉大学经济与管理学院2022年暑期学校项目文件，本人为项目共同作者之一，另一位作者已经上传过文件，此处作为备份
-
-小组项目内容为复刻MIS Querty上的一篇文献，文件既存以此
+Project Document for 2022 Summer Camp in EM School, WHU
